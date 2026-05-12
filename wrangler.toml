@@ -1,0 +1,8 @@
+name = "fal-mcp-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+account_id = "548aa00c26a29f4eddd4487d8b3fc79d"
+
+# Secrets set out-of-band via `wrangler secret put`:
+#   FAL_KEY       — fal.ai API key (kept server-side, never sent to client)
+#   PROXY_TOKEN   — random shared secret; clients must pass it as ?key=<token>

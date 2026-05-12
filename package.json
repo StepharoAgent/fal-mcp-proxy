@@ -1,0 +1,16 @@
+{
+  "name": "fal-mcp-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker proxy gating https://mcp.fal.ai/mcp behind a ?key=<token> URL — lets you use the official fal.ai remote MCP from any client that only accepts a URL (claude.ai custom connectors, ChatGPT apps, etc.).",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240605.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.0.0"
+  }
+}
