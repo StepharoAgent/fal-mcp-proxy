@@ -5,41 +5,65 @@
  * (https://mcp.fal.ai/mcp) and lets you use it from clients that only accept
  * a plain URL — e.g. claude.ai custom connectors, ChatGPT custom apps.
  *
- * Why it exists:
- *   - fal.ai's hosted MCP needs `Authorization: Bearer <FAL_KEY>` on every
- *     request, but claude.ai's "Add Custom Connector" dialog only has a URL
- *     field.
- *   - Bare-URL connectors are accepted by claude.ai when the server does NOT
- *     advertise OAuth metadata, so a simple gated reverse-proxy works.
- *
  * Auth model:
- *   - Client passes a shared secret as `?key=<PROXY_TOKEN>` on every request.
- *   - The Worker validates the token (constant-time compare) and, if good,
- *     strips it from the upstream URL and injects `Authorization: Bearer
- *     <FAL_KEY>` toward mcp.fal.ai.
- *   - Streamable HTTP (chunked + SSE-style) is forwarded transparently —
- *     `fetch()` already gives you a streaming body in both directions on
- *     Workers.
+ *   - Client passes a shared secret as `?key=<PROXY_TOKEN>` on every request,
+ *     OR as `Authorization: Bearer <PROXY_TOKEN>` for CLI use.
+ *   - The Worker strips it and injects `Authorization: Bearer <FAL_KEY>` toward
+ *     mcp.fal.ai. The FAL_KEY never reaches the client.
  *
- * Endpoints (everything passed through 1:1, only authorization changes):
- *   /mcp           → https://mcp.fal.ai/mcp
- *   /              → small status page
- *   /healthz       → "ok"
- *
- * Any path that doesn't match falls through to fal.ai as well, so future
- * upstream additions (e.g. /resources) keep working without redeploy.
+ * Browser-client niceties (required for claude.ai / ChatGPT web):
+ *   - CORS preflight (OPTIONS) is always answered 204 with permissive headers.
+ *   - All responses carry `Access-Control-Allow-Origin` + expose
+ *     `mcp-session-id` so the MCP client can maintain its session.
+ *   - OAuth discovery probes return 404 (not 401) so the client falls back to
+ *     the URL-only / Bearer flow instead of starting an OAuth dance.
  */
 
 export interface Env {
-  /** fal.ai API key — server-side only, never echoed back. */
   FAL_KEY: string;
-  /** Shared secret the client must pass via ?key=<token>. */
   PROXY_TOKEN: string;
 }
 
 const UPSTREAM = "https://mcp.fal.ai";
 
-/** Strip the proxy `key` query param and any other auth-ish ones before forwarding. */
+/* ─────────────── helpers ─────────────── */
+
+function cors(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin") || "*";
+  const reqHeaders =
+    req.headers.get("access-control-request-headers") ||
+    "content-type, authorization, mcp-protocol-version, mcp-session-id, x-requested-with";
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": "GET, POST, OPTIONS, DELETE",
+    "access-control-allow-headers": reqHeaders,
+    "access-control-expose-headers": "mcp-session-id, mcp-protocol-version",
+    "access-control-max-age": "86400",
+    "vary": "origin",
+  };
+}
+
+function withCors(res: Response, req: Request): Response {
+  const headers = new Headers(res.headers);
+  for (const [k, v] of Object.entries(cors(req))) headers.set(k, v);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
+function extractProxyToken(req: Request): string | null {
+  const fromQuery = new URL(req.url).searchParams.get("key");
+  if (fromQuery) return fromQuery;
+  const auth = req.headers.get("authorization");
+  if (auth?.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  return null;
+}
+
 function buildUpstreamUrl(req: Request): URL {
   const inUrl = new URL(req.url);
   const out = new URL(UPSTREAM + inUrl.pathname);
@@ -50,28 +74,20 @@ function buildUpstreamUrl(req: Request): URL {
   return out;
 }
 
-/** Constant-time string compare to avoid timing oracles on PROXY_TOKEN. */
-function safeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return mismatch === 0;
-}
-
-/** Pull the proxy token from ?key= OR from a Bearer header (so CLI clients work too). */
-function extractProxyToken(req: Request): string | null {
-  const fromQuery = new URL(req.url).searchParams.get("key");
-  if (fromQuery) return fromQuery;
-  const auth = req.headers.get("authorization");
-  if (auth?.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
-  return null;
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 function unauthorized(): Response {
-  return new Response(
-    JSON.stringify({ error: "unauthorized", hint: "append ?key=<PROXY_TOKEN> to the URL" }),
-    { status: 401, headers: { "content-type": "application/json" } },
-  );
+  // No WWW-Authenticate header — we don't want clients to start an OAuth flow.
+  return jsonResponse({ error: "unauthorized", hint: "append ?key=<PROXY_TOKEN> to the URL" }, 401);
+}
+
+function notFound(): Response {
+  return jsonResponse({ error: "not_found" }, 404);
 }
 
 const STATUS_HTML = `<!doctype html>
@@ -90,51 +106,65 @@ const STATUS_HTML = `<!doctype html>
 <p class="muted">Source: <a href="https://github.com/StepharoAgent/fal-mcp-proxy">github.com/StepharoAgent/fal-mcp-proxy</a></p>
 `;
 
+/* ─────────────── worker ─────────────── */
+
 export default {
   async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
-    // Sanity: fail fast if the operator forgot a secret.
     if (!env.FAL_KEY || !env.PROXY_TOKEN) {
-      return new Response("misconfigured: FAL_KEY and PROXY_TOKEN secrets required", {
-        status: 500,
-      });
+      return withCors(new Response("misconfigured: FAL_KEY and PROXY_TOKEN secrets required", { status: 500 }), req);
+    }
+
+    // CORS preflight — must always succeed without auth.
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors(req) });
     }
 
     // Public, unauthenticated routes.
     if (req.method === "GET" && url.pathname === "/healthz") {
-      return new Response("ok\n", { headers: { "content-type": "text/plain" } });
+      return withCors(new Response("ok\n", { headers: { "content-type": "text/plain" } }), req);
     }
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
-      return new Response(STATUS_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+      return withCors(new Response(STATUS_HTML, { headers: { "content-type": "text/html; charset=utf-8" } }), req);
     }
 
-    // Gate everything else.
+    // OAuth discovery probes — answer 404 (not 401) so the client doesn't start
+    // an OAuth flow. Bare-URL connectors then fall through to the Bearer path.
+    if (
+      req.method === "GET" &&
+      (url.pathname.startsWith("/.well-known/oauth-") ||
+        url.pathname === "/.well-known/openid-configuration" ||
+        url.pathname.startsWith("/.well-known/mcp"))
+    ) {
+      return withCors(notFound(), req);
+    }
+
+    // Gate.
     const token = extractProxyToken(req);
     if (!token || !safeEqual(token, env.PROXY_TOKEN)) {
-      return unauthorized();
+      return withCors(unauthorized(), req);
     }
 
-    // Build upstream request: drop ?key, rewrite Authorization to fal.ai bearer.
+    // Proxy.
     const upstreamUrl = buildUpstreamUrl(req);
     const headers = new Headers(req.headers);
     headers.delete("host");
     headers.delete("cf-connecting-ip");
     headers.delete("cf-ray");
     headers.delete("cf-visitor");
+    headers.delete("cf-ipcountry");
     headers.delete("x-forwarded-for");
     headers.delete("x-forwarded-proto");
     headers.delete("x-real-ip");
     headers.set("authorization", `Bearer ${env.FAL_KEY}`);
-    // fal.ai expects a plain User-Agent; some clients omit it.
     if (!headers.has("user-agent")) {
-      headers.set("user-agent", "fal-mcp-proxy/0.1 (+https://github.com/StepharoAgent/fal-mcp-proxy)");
+      headers.set("user-agent", "fal-mcp-proxy/0.2 (+https://github.com/StepharoAgent/fal-mcp-proxy)");
     }
 
     const init: RequestInit = {
       method: req.method,
       headers,
-      // GET/HEAD must not have a body; everything else streams through.
       body: req.method === "GET" || req.method === "HEAD" ? undefined : req.body,
       redirect: "manual",
     };
@@ -143,19 +173,15 @@ export default {
     try {
       upstream = await fetch(upstreamUrl.toString(), init);
     } catch (err) {
-      return new Response(
-        JSON.stringify({ error: "upstream_fetch_failed", detail: String(err) }),
-        { status: 502, headers: { "content-type": "application/json" } },
-      );
+      return withCors(jsonResponse({ error: "upstream_fetch_failed", detail: String(err) }, 502), req);
     }
 
-    // Pass the response through verbatim (status + headers + streaming body).
-    // Strip hop-by-hop / Cloudflare-specific response headers so the client
-    // gets a clean MCP response.
     const outHeaders = new Headers(upstream.headers);
     outHeaders.delete("transfer-encoding");
     outHeaders.delete("connection");
     outHeaders.delete("keep-alive");
+    // Add CORS to the upstream response too.
+    for (const [k, v] of Object.entries(cors(req))) outHeaders.set(k, v);
 
     return new Response(upstream.body, {
       status: upstream.status,
